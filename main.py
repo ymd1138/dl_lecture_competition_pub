@@ -2,6 +2,7 @@ import os, sys
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torchmetrics import Accuracy
 import hydra
 from omegaconf import DictConfig
@@ -13,6 +14,25 @@ from src.datasets import ThingsMEGDataset
 from src.models import BasicConvClassifier
 from src.utils import set_seed
 
+class TransformDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+
+    def __getitem__(self, index):
+        data, *rest = self.dataset[index]
+        if self.transform:
+            data = self.transform(data)
+        return (data, *rest)
+
+    def __len__(self):
+        return len(self.dataset)
+
+def repeat_channels(x):
+    if x.size(0) < 271:
+        return x.repeat(271 // x.size(0) + 1, 1)[:271, :]
+    else:
+        return x[:271, :]
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def run(args: DictConfig):
@@ -22,39 +42,28 @@ def run(args: DictConfig):
     if args.use_wandb:
         wandb.init(mode="online", dir=logdir, project="MEG-classification")
 
-    # ------------------
-    #    Dataloader
-    # ------------------
+    transform = repeat_channels
     loader_args = {"batch_size": args.batch_size, "num_workers": args.num_workers}
     
     train_set = ThingsMEGDataset("train", args.data_dir)
+    train_set = TransformDataset(train_set, transform)
+    print("Number of channels:", train_set.dataset.num_channels)
     train_loader = torch.utils.data.DataLoader(train_set, shuffle=True, **loader_args)
+    
     val_set = ThingsMEGDataset("val", args.data_dir)
+    val_set = TransformDataset(val_set, transform)
     val_loader = torch.utils.data.DataLoader(val_set, shuffle=False, **loader_args)
+    
     test_set = ThingsMEGDataset("test", args.data_dir)
-    test_loader = torch.utils.data.DataLoader(
-        test_set, shuffle=False, batch_size=args.batch_size, num_workers=args.num_workers
-    )
+    test_set = TransformDataset(test_set, transform)
+    test_loader = torch.utils.data.DataLoader(test_set, shuffle=False, batch_size=args.batch_size, num_workers=args.num_workers)
 
-    # ------------------
-    #       Model
-    # ------------------
-    model = BasicConvClassifier(
-        train_set.num_classes, train_set.seq_len, train_set.num_channels
-    ).to(args.device)
+    model = BasicConvClassifier(train_set.dataset.num_classes, train_set.dataset.seq_len, train_set.dataset.num_channels).to(args.device)
 
-    # ------------------
-    #     Optimizer
-    # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.01)  # 学習率を低く設定
 
-    # ------------------
-    #   Start training
-    # ------------------  
     max_val_acc = 0
-    accuracy = Accuracy(
-        task="multiclass", num_classes=train_set.num_classes, top_k=10
-    ).to(args.device)
+    accuracy = Accuracy(task="multiclass", num_classes=train_set.dataset.num_classes, top_k=10).to(args.device)
       
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1}/{args.epochs}")
@@ -62,7 +71,7 @@ def run(args: DictConfig):
         train_loss, train_acc, val_loss, val_acc = [], [], [], []
         
         model.train()
-        for X, y, subject_idxs in tqdm(train_loader, desc="Train"):
+        for X, y, _ in tqdm(train_loader, desc="Train"):
             X, y = X.to(args.device), y.to(args.device)
 
             y_pred = model(X)
@@ -78,7 +87,7 @@ def run(args: DictConfig):
             train_acc.append(acc.item())
 
         model.eval()
-        for X, y, subject_idxs in tqdm(val_loader, desc="Validation"):
+        for X, y, _ in tqdm(val_loader, desc="Validation"):
             X, y = X.to(args.device), y.to(args.device)
             
             with torch.no_grad():
@@ -97,19 +106,15 @@ def run(args: DictConfig):
             torch.save(model.state_dict(), os.path.join(logdir, "model_best.pt"))
             max_val_acc = np.mean(val_acc)
             
-    
-    # ----------------------------------
-    #  Start evaluation with best model
-    # ----------------------------------
     model.load_state_dict(torch.load(os.path.join(logdir, "model_best.pt"), map_location=args.device))
 
     preds = [] 
     model.eval()
-    for X, subject_idxs in tqdm(test_loader, desc="Validation"):        
+    for X, subject_idxs in tqdm(test_loader, desc="Validation"):
         preds.append(model(X.to(args.device)).detach().cpu())
         
     preds = torch.cat(preds, dim=0).numpy()
-    np.save(os.path.join(logdir, "submission"), preds)
+    np.save(os.path.join(logdir, "submission.npy"), preds)
     cprint(f"Submission {preds.shape} saved at {logdir}", "cyan")
 
 
